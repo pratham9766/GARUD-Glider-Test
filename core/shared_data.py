@@ -150,7 +150,13 @@ class PayloadSnapshot:
     apogee_detected: bool = False
     payload_ejected: bool = False
     glider_deployed: bool = False
+    flight_armed: bool = False
+    guidance_requested: bool = False
     actuation_enabled: bool = False
+    actuation_inhibit_reason: str = "NOT_ARMED"
+    servo_ok: bool = False
+    gnc_ok: bool = False
+    gnc_timestamp_ns: int = 0
     battery: float = 100.0
     status: str = "OK"
     previous_state: str = ""

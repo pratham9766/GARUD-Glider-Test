@@ -28,6 +28,7 @@ class FlightStateController:
     glider_deploy_time_s: float | None = None
     landing_check_start_s: float | None = None
     max_altitude_m: float = 0.0
+    ground_altitude_m: float | None = None
     confirmation_target: MissionState | None = None
     confirmation_count: int = 0
 
@@ -40,21 +41,55 @@ class FlightStateController:
 
     def arm(self) -> None:
         """Arm the flight controller on the pad."""
-        self._transition(MissionState.ARMED_PAD, reason="operator_arm", status="ARMED")
+        snap = self.shared.get_snapshot()
+        if not snap.barometer_ok or snap.baro_timestamp_ns <= 0:
+            raise RuntimeError("Cannot arm without a valid barometer sample")
+        self.ground_altitude_m = snap.baro_altitude
+        self.previous_altitude_m = 0.0
+        self.previous_time_s = time.time()
+        self.max_altitude_m = 0.0
+        self._transition(
+            MissionState.ARMED_PAD,
+            reason="operator_arm",
+            status="ARMED",
+            flight_armed=True,
+            guidance_requested=False,
+            actuation_enabled=False,
+            actuation_inhibit_reason="WAITING_FOR_GUIDED_DESCENT",
+        )
 
     def disarm(self) -> None:
         """Return from ARMED_PAD to DISARMED before launch."""
-        self._transition(MissionState.DISARMED, reason="operator_disarm", status="DISARMED")
+        self._transition(
+            MissionState.DISARMED,
+            reason="operator_disarm",
+            status="DISARMED",
+            flight_armed=False,
+            guidance_requested=False,
+            actuation_enabled=False,
+            actuation_inhibit_reason="DISARMED",
+        )
 
     def abort(self) -> None:
         """Enter abort state without directly firing deployment hardware."""
-        self._transition(MissionState.ABORT, reason="abort_requested", status="ABORT")
+        self._transition(
+            MissionState.ABORT,
+            reason="abort_requested",
+            status="ABORT",
+            guidance_requested=False,
+            actuation_enabled=False,
+            actuation_inhibit_reason="ABORT",
+        )
 
     def update(self) -> MissionState:
         """Evaluate one state-machine tick from the latest shared snapshot."""
         snap = self.shared.get_snapshot()
         now = time.time()
-        altitude_m = max(0.0, snap.baro_altitude)
+        # Flight thresholds are AGL.  Capturing the pad pressure altitude at
+        # arm prevents a site elevation (for example Pune MSL altitude) from
+        # being misinterpreted as launch altitude.
+        baseline = snap.baro_altitude if self.ground_altitude_m is None else self.ground_altitude_m
+        altitude_m = max(0.0, snap.baro_altitude - baseline)
         velocity_mps = self._vertical_velocity(snap, altitude_m, now)
         accel_g = self._accel_magnitude_g(snap)
         self.max_altitude_m = max(self.max_altitude_m, altitude_m)
@@ -164,8 +199,10 @@ class FlightStateController:
                     MissionState.GUIDED_DESCENT,
                     reason="glider_deploy_settle_elapsed",
                     glider_deployed=True,
-                    actuation_enabled=True,
-                    status="ACTUATION_ENABLED",
+                    guidance_requested=True,
+                    actuation_enabled=False,
+                    actuation_inhibit_reason="AWAITING_SAFETY_GATE",
+                    status="GUIDANCE_REQUESTED",
                 )
 
         elif self.current_state == MissionState.GUIDED_DESCENT:
@@ -279,6 +316,9 @@ class FlightStateController:
                         "persistence_sec": config.LANDING_DETECT_TIME_SEC,
                     },
                     actuation_enabled=False,
+                    guidance_requested=False,
+                    flight_armed=False,
+                    actuation_inhibit_reason="LANDED",
                     status="LANDED",
                 )
         else:

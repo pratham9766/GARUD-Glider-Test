@@ -60,6 +60,8 @@ class RealGliderServos:
             f"right={config.GLIDER_RIGHT_CHANNEL}, drogue={config.GLIDER_DROGUE_CHANNEL} "
             f"at PCA9685 0x{config.SERVO_CONTROLLER_ADDRESS:02X}."
         )
+        # Establish a known safe output before accepting runtime commands.
+        self.set_angles(90.0, 90.0, config.GLIDER_DROGUE_SAFE_ANGLE)
 
     def set_angles(self, left: float, right: float, drogue: float = None):
         # Constrain to 0-180
@@ -72,6 +74,11 @@ class RealGliderServos:
             self._kit.servo[config.GLIDER_DROGUE_CHANNEL].angle = max(0.0, min(180.0, drogue))
 
     def close(self):
+        # Neutralize flight controls before releasing PWM.  Do not move the
+        # deployment channel during shutdown because it may already be fired.
+        self._kit.servo[config.GLIDER_LEFT_CHANNEL].angle = 90.0
+        self._kit.servo[config.GLIDER_RIGHT_CHANNEL].angle = 90.0
+        time.sleep(0.1)
         self._kit.servo[config.GLIDER_LEFT_CHANNEL].angle = None
         self._kit.servo[config.GLIDER_RIGHT_CHANNEL].angle = None
         self._kit.servo[config.GLIDER_DROGUE_CHANNEL].angle = None
@@ -85,6 +92,7 @@ def glider_servo_worker(
     stop_event,
     use_mock: bool | None = None,
     command_drogue: bool = True,
+    require_actuation_enabled: bool = False,
 ) -> None:
     """Read commands from SharedData and drive mock or real glider servos.
 
@@ -112,16 +120,31 @@ def glider_servo_worker(
         while not stop_event.is_set():
             snap = shared.get_snapshot()
             
-            # GNC FlightComputer outputs these (usually between 0 and 180)
+            # Production is fail-closed: only the safety supervisor can allow
+            # left/right control. Bench tests opt out explicitly so they can
+            # exercise the complete command path while unloaded.
+            controls_enabled = snap.actuation_enabled or not require_actuation_enabled
+            left = snap.servo_left if controls_enabled else 90.0
+            right = snap.servo_right if controls_enabled else 90.0
+            drogue = None
+            if command_drogue:
+                drogue = (
+                    snap.servo_drogue
+                    if snap.glider_deployed
+                    else config.GLIDER_DROGUE_SAFE_ANGLE
+                )
             hw.set_angles(
-                left=snap.servo_left, 
-                right=snap.servo_right,
-                drogue=snap.servo_drogue if command_drogue else None,
+                left=left,
+                right=right,
+                drogue=drogue,
             )
+            shared.update(servo_ok=True)
             time.sleep(0.05)  # 20 Hz loop
             
     except Exception as e:
+        shared.update(servo_ok=False, actuation_enabled=False)
         logger.error("Glider servo worker crashed: %s", e)
     finally:
+        shared.update(servo_ok=False)
         hw.close()
         logger.info("Glider servo worker stopped.")

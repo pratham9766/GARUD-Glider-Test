@@ -132,6 +132,7 @@ class FlightComputer:
         use_simulator=True,
         drop_height: float = 0.0,
         enable_state_persistence: bool = True,
+        external_state_authority: bool = False,
     ):
         log.info("Initializing Flight Computer...")
 
@@ -167,7 +168,8 @@ class FlightComputer:
         self._WindEstimatorRLS = _WindEstimatorRLS
 
         self.shared = shared
-        self.enable_state_persistence = enable_state_persistence
+        self.external_state_authority = bool(external_state_authority and shared is not None)
+        self.enable_state_persistence = enable_state_persistence and not self.external_state_authority
         self.dt = 0.05  # 20 Hz loop
 
         if self.shared is not None:
@@ -569,12 +571,27 @@ class FlightComputer:
             self.ekf_alt.predict(9.81 - accel_z_earth_down)
             self.ekf_alt.update_baro(baro_alt)
 
-            # 3. State Machine
-            state = self.state_machine.update(self.ekf_alt.altitude, self.ekf_alt.vertical_velocity)
+            agl_altitude = max(0.0, self.ekf_alt.altitude - self.state_machine.ground_altitude)
+
+            # Production has one state authority: core.FlightStateController.
+            # The legacy internal state machine remains available for SITL and
+            # deterministic mock tests only.
+            if self.external_state_authority:
+                shared_snap = self.shared.get_snapshot()
+                try:
+                    state = self.FlightState[shared_snap.state]
+                except KeyError:
+                    state = self.FlightState.BOOST
+                guidance_allowed = bool(shared_snap.actuation_enabled)
+                drogue_fired = bool(shared_snap.glider_deployed)
+            else:
+                state = self.state_machine.update(self.ekf_alt.altitude, self.ekf_alt.vertical_velocity)
+                guidance_allowed = state == self.FlightState.GUIDED_DESCENT
+                drogue_fired = self.state_machine.drogue_fired
             if self.shared is not None:
                 drogue_angle = (
                     config.GLIDER_DROGUE_DEPLOY_ANGLE
-                    if self.state_machine.drogue_fired
+                    if drogue_fired
                     else config.GLIDER_DROGUE_SAFE_ANGLE
                 )
                 self.shared.update(servo_drogue=drogue_angle)
@@ -584,13 +601,13 @@ class FlightComputer:
             right_servo = 90.0
             controller_used = "NEUTRAL"
 
-            if state == self.FlightState.GUIDED_DESCENT:
+            if state == self.FlightState.GUIDED_DESCENT and guidance_allowed:
                 # RL uses legacy 1e-5 coordinate projection for backward compat with trained model
                 aim_x = self.target_x
                 aim_y = self.target_y
                 target_bearing = math.atan2(aim_y - curr_y, aim_x - curr_x)
                 dist       = math.hypot(aim_x - curr_x, aim_y - curr_y)
-                alt_excess = self.ekf_alt.altitude - (_nue_dist_m / self.glide_ratio)
+                alt_excess = agl_altitude - (_nue_dist_m / self.glide_ratio)
 
                 rl_succeeded = False
                 if self.rl_active and gps_fresh:
@@ -598,7 +615,7 @@ class FlightComputer:
                         obs = self._obs_from_state(
                             curr_x, curr_y, target_bearing, dist, alt_excess,
                             pitch, roll, gz,
-                            gps_speed, gps_heading, self.ekf_alt.altitude
+                            gps_speed, gps_heading, agl_altitude
                         )
                         raw     = self._rl_inference(obs)
                         delta_a, delta_s = self._validate_and_rescale(raw)
@@ -616,11 +633,11 @@ class FlightComputer:
                     else:
                         # PID guidance using NUE local frame bearing (geometrically correct)
                         gains = self.config['gain_schedules']
-                        if self.ekf_alt.altitude > gains['cruise']['min_alt_agl']:
+                        if agl_altitude > gains['cruise']['min_alt_agl']:
                             self.heading_pid.kp = gains['cruise']['heading_kp']
                             self.heading_pid.ki = gains['cruise']['heading_ki']
                             self.heading_pid.kd = gains['cruise']['heading_kd']
-                        elif self.ekf_alt.altitude > gains['approach']['min_alt_agl']:
+                        elif agl_altitude > gains['approach']['min_alt_agl']:
                             self.heading_pid.kp = gains['approach']['heading_kp']
                             self.heading_pid.ki = gains['approach']['heading_ki']
                             self.heading_pid.kd = gains['approach']['heading_kd']
@@ -633,10 +650,10 @@ class FlightComputer:
                         # PID uses NUE bearing for correct metric-space heading error
                         delta_a = self.heading_pid.compute(_nue_bearing, gps_heading, self.dt)
                         # Final approach: cap aileron to ±output_limit_deg to prevent oscillation
-                        if self.ekf_alt.altitude <= gains['approach']['min_alt_agl']:
+                        if agl_altitude <= gains['approach']['min_alt_agl']:
                             _final_limit = gains['final'].get('output_limit_deg', 10.0)
                             delta_a = max(-_final_limit, min(_final_limit, delta_a))
-                        delta_s = 30.0 if self.ekf_alt.altitude < 10.0 else 0.0
+                        delta_s = 30.0 if agl_altitude < 10.0 else 0.0
                         controller_used = "PID"
 
                 self.prev_delta_a = delta_a
@@ -646,6 +663,11 @@ class FlightComputer:
                 right_servo = max(60.0, min(120.0, 90.0 + delta_s + delta_a))
 
             self.servos.write(left_servo, right_servo)
+            if self.shared is not None:
+                self.shared.update(
+                    gnc_ok=True,
+                    gnc_timestamp_ns=time.monotonic_ns(),
+                )
             self.last_controller_used = controller_used
             self.controller_counts[controller_used] = self.controller_counts.get(controller_used, 0) + 1
             self.loop_count += 1
@@ -664,7 +686,7 @@ class FlightComputer:
             if frame_id % 20 == 0:
                 log.info(
                     f"[{controller_used:<6}] STATE:{state.name:<22} | "
-                    f"ALT:{baro_alt:>6.1f}m | "
+                    f"AGL:{agl_altitude:>6.1f}m | "
                     f"DIST:{_nue_dist_m:>7.1f}m | "
                     f"SRV L:{left_servo:>5.1f} R:{right_servo:>5.1f}"
                 )
