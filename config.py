@@ -6,7 +6,7 @@ Pin mapping follows the working Garud HAT setup:
     BNO085 (IMU)         - I2C1 : SDA=GPIO2, SCL=GPIO3
     PCA9685 (Servo drv)  - I2C1 : SDA=GPIO2, SCL=GPIO3, OE=GPIO4
     BMP388 (Baro)        - SPI0 : MISO=GPIO9, MOSI=GPIO10, SCK=GPIO11, CS=GPIO8
-    SC16IS750 GPS bridge - SPI0 : shared SPI0, CS=GPIO7
+    NEO-M8N GPS         - USB UART by default: /dev/ttyUSB0 at 9600 baud
     ULN2003 (Stepper)    - GPIO : IN1=GPIO25, IN2=GPIO24, IN3=GPIO23, IN4=GPIO18
     Buzzer               - GPIO16
 
@@ -157,10 +157,13 @@ STORAGE_VALIDATION_INTERVAL_SEC = 20.0
 # Tested GARUDA HAT connections:
 #   BNO085 + PCA9685 + INA219: I2C1 on GPIO2/GPIO3
 #   BMP388: SPI0 on GPIO9/GPIO10/GPIO11 with CS=GPIO8
-#   GPS M8N: SC16IS750 UART bridge on SPI0 CE1/GPIO7
+#   GPS M8N: USB UART /dev/ttyUSB0 by default; SC16IS750 remains optional
 #   XBee3: Pi primary UART on GPIO14/GPIO15
-GPS_TRANSPORT = "SC16IS750_SPI"
-GPS_PORT = "SC16IS750@SPI0.CE1"
+# NEO-M8N connected through a USB-to-UART adapter on Raspberry Pi Zero 2 W.
+# Set GPS_TRANSPORT back to "SC16IS750_SPI" for the Garud HAT bridge.
+GPS_TRANSPORT = "USB_SERIAL"
+GPS_PORT = "/dev/ttyUSB0"
+GPS_SERIAL_TIMEOUT_SEC = 0.4
 XBEE_SERIAL_PORT = "/dev/ttyAMA0"
 XBEE_PORT = XBEE_SERIAL_PORT
 GPS_BAUDRATE = 9600
@@ -198,6 +201,8 @@ GIMBAL_SERVO_CHANNEL = 4
 GLIDER_LEFT_CHANNEL = 0
 GLIDER_RIGHT_CHANNEL = 1
 GLIDER_DROGUE_CHANNEL = 2
+GLIDER_DROGUE_SAFE_ANGLE = 60.0
+GLIDER_DROGUE_DEPLOY_ANGLE = 120.0
 
 BMP388_CS_PIN = 8
 BMP388_CS = _board_pin("D8", BMP388_CS_PIN)
@@ -252,6 +257,7 @@ MAP_SAVE_PATH = PROJECT_ROOT / "data" / "maps"
 # ---------------------------------------------------------------------------
 SIMULATION_DURATION_SEC = 30.0
 SIMULATION_DESCENT_START_SEC = 5.0
+MOCK_GLIDER_DESCENT_ONLY = False
 
 # Pune reference coordinates for mock GPS
 MOCK_GPS_LAT = 18.5204

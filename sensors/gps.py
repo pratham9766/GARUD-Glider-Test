@@ -15,7 +15,6 @@ import time
 from abc import ABC, abstractmethod
 
 import config
-from core.mission_state import MissionState
 from core.shared_data import SharedData
 
 logger = logging.getLogger(__name__)
@@ -41,6 +40,7 @@ class MockGPS(BaseGPS):
         self._lon = config.MOCK_GPS_LON
         self._alt = config.MOCK_START_ALTITUDE_M
         self._step = 0
+        self._started_at = time.monotonic()
 
     def read(self) -> dict:
         self._step += 1
@@ -48,7 +48,12 @@ class MockGPS(BaseGPS):
         angle = self._step * 0.05
         self._lat += 0.00001 * math.sin(angle) + random.uniform(-0.000005, 0.000005)
         self._lon += 0.00001 * math.cos(angle) + random.uniform(-0.000005, 0.000005)
-        self._alt = max(0.0, self._alt - random.uniform(0.0, 0.5))
+        if config.MOCK_GLIDER_DESCENT_ONLY:
+            elapsed = time.monotonic() - self._started_at
+            duration = max(config.SIMULATION_DURATION_SEC, 1.0)
+            self._alt = config.MOCK_START_ALTITUDE_M * max(0.0, 1.0 - elapsed / duration)
+        else:
+            self._alt = max(0.0, self._alt - random.uniform(0.0, 0.5))
         return {
             "timestamp_ns": time.monotonic_ns(),
             "latitude": self._lat,
@@ -67,14 +72,18 @@ class MockGPS(BaseGPS):
 
 
 class RealGPS(BaseGPS):
-    """NEO-M8N GPS through the Garud HAT SC16IS750 SPI UART bridge."""
+    """NEO-M8N using USB serial NMEA or the Garud HAT SPI-UART bridge."""
 
     def __init__(self) -> None:
-        import bus_manager
-        from sensors.gps_m8n import GPSM8N
-
-        self._gps = GPSM8N(bus_manager.get_spi())
+        self._transport = config.GPS_TRANSPORT.upper()
+        self._serial = None
+        self._gps = None
+        self._pynmea2 = None
+        self._last_sentence_monotonic = 0.0
+        self._gga_fix_quality = 0
+        self._rmc_active = False
         self._last = {
+            "timestamp_ns": 0,
             "latitude": 0.0,
             "longitude": 0.0,
             "altitude": 0.0,
@@ -85,16 +94,43 @@ class RealGPS(BaseGPS):
             "ground_speed_mps": None,
             "course_deg": None,
         }
-        logger.info(
-            "GPS M8N initialized through SC16IS750 on SPI0 CE1/GPIO%d @ %d.",
-            config.GPS_SC16IS750_CS_PIN,
-            config.GPS_BAUDRATE,
-        )
+
+        if self._transport in {"USB_SERIAL", "SERIAL", "UART"}:
+            import pynmea2
+            import serial
+
+            self._pynmea2 = pynmea2
+            self._serial = serial.Serial(
+                config.GPS_PORT,
+                config.GPS_BAUDRATE,
+                timeout=config.GPS_SERIAL_TIMEOUT_SEC,
+            )
+            logger.info(
+                "GPS M8N initialized on %s @ %d baud (timeout %.1fs).",
+                config.GPS_PORT,
+                config.GPS_BAUDRATE,
+                config.GPS_SERIAL_TIMEOUT_SEC,
+            )
+        elif self._transport == "SC16IS750_SPI":
+            import bus_manager
+            from sensors.gps_m8n import GPSM8N
+
+            self._gps = GPSM8N(bus_manager.get_spi())
+            logger.info(
+                "GPS M8N initialized through SC16IS750 on SPI0 CE1/GPIO%d @ %d.",
+                config.GPS_SC16IS750_CS_PIN,
+                config.GPS_BAUDRATE,
+            )
+        else:
+            raise ValueError(f"Unsupported GPS_TRANSPORT: {config.GPS_TRANSPORT}")
 
     def read(self) -> dict:
+        if self._serial is not None:
+            return self._read_serial_nmea()
+
         fix = self._gps.read_fix(timeout_s=1.0)
         if not fix:
-            return {**self._last, "fix_ok": False, "timestamp_ns": time.monotonic_ns()}
+            return {**self._last, "fix_ok": False}
 
         if fix.get("lat") is not None:
             self._last["latitude"] = fix["lat"]
@@ -109,10 +145,88 @@ class RealGPS(BaseGPS):
         self._last["hdop"] = fix.get("hdop")
         self._last["ground_speed_mps"] = fix.get("ground_speed_mps")
         self._last["course_deg"] = fix.get("course_deg")
-        return {**self._last, "timestamp_ns": time.monotonic_ns()}
+        self._last["timestamp_ns"] = time.monotonic_ns()
+        return dict(self._last)
+
+    def _read_serial_nmea(self) -> dict:
+        """Read one NMEA sentence and merge GGA/RMC fields into the last fix."""
+        raw = self._serial.readline()
+        if not raw:
+            return self._serial_snapshot()
+
+        line = raw.decode("ascii", errors="ignore").strip()
+        if not line.startswith(("$GNGGA", "$GPGGA", "$GNRMC", "$GPRMC")):
+            return self._serial_snapshot()
+
+        try:
+            message = self._pynmea2.parse(line)
+        except (self._pynmea2.ParseError, ValueError, TypeError) as exc:
+            logger.debug("Ignoring malformed NMEA sentence: %s", exc)
+            return self._serial_snapshot()
+
+        now_mono = time.monotonic()
+        self._last_sentence_monotonic = now_mono
+        self._last["timestamp_ns"] = time.monotonic_ns()
+
+        if line.startswith(("$GNGGA", "$GPGGA")):
+            self._gga_fix_quality = int(message.gps_qual or 0)
+            self._last["satellites"] = int(message.num_sats or 0)
+            self._last["hdop"] = self._optional_float(message.horizontal_dil)
+            if self._gga_fix_quality > 0:
+                self._last["latitude"] = float(message.latitude)
+                self._last["longitude"] = float(message.longitude)
+                altitude = self._optional_float(message.altitude)
+                if altitude is not None:
+                    self._last["altitude"] = altitude
+
+        elif line.startswith(("$GNRMC", "$GPRMC")):
+            self._rmc_active = message.status == "A"
+            if self._rmc_active:
+                self._last["latitude"] = float(message.latitude)
+                self._last["longitude"] = float(message.longitude)
+                speed_knots = self._optional_float(message.spd_over_grnd) or 0.0
+                self._last["ground_speed_mps"] = speed_knots * 0.514444
+                self._last["course_deg"] = self._optional_float(message.true_course)
+
+        return self._serial_snapshot()
+
+    def _serial_snapshot(self) -> dict:
+        sentence_fresh = (
+            self._last_sentence_monotonic > 0.0
+            and time.monotonic() - self._last_sentence_monotonic
+            <= config.GPS_FIX_STALE_TIMEOUT_SEC
+        )
+        fix_ok = sentence_fresh and (self._gga_fix_quality > 0 or self._rmc_active)
+        self._last["fix_ok"] = fix_ok
+        self._last["fix_type"] = self._nmea_fix_type() if fix_ok else "NO FIX"
+        return dict(self._last)
+
+    def _nmea_fix_type(self) -> str:
+        labels = {
+            1: "GPS",
+            2: "DGPS",
+            4: "RTK FIX",
+            5: "RTK FLOAT",
+            6: "ESTIMATED",
+        }
+        if self._gga_fix_quality > 0:
+            return labels.get(self._gga_fix_quality, f"FIX {self._gga_fix_quality}")
+        return "ACTIVE" if self._rmc_active else "NO FIX"
+
+    @staticmethod
+    def _optional_float(value) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def close(self) -> None:
-        pass
+        if self._serial is not None and self._serial.is_open:
+            self._serial.close()
+        if self._gps is not None and hasattr(self._gps, "close"):
+            self._gps.close()
 
 
 def create_gps() -> BaseGPS:
@@ -189,7 +303,8 @@ def gps_worker(shared: SharedData, stop_event: threading.Event) -> None:
                 shared.update(gps_ok=False, status="GPS_ERROR")
                 shared.record_worker_error("GPS", exc, expected_hz=config.GPS_EXPECTED_HZ)
 
-            stop_event.wait(0.5)
+            poll_interval = 0.5 if config.USE_MOCK_HARDWARE else 0.05
+            stop_event.wait(poll_interval)
     finally:
         gps.close()
         logger.info("GPS worker stopped.")

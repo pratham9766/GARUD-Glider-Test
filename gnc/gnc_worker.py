@@ -6,6 +6,7 @@ import hashlib
 import logging
 import yaml
 import numpy as np
+import config
 
 try:
     import onnxruntime as ort
@@ -93,9 +94,13 @@ class SharedBaro:
 class SharedGPS:
     def __init__(self, shared):
         self.shared = shared
+        self.last_timestamp_ns = 0
+        self.last_fix_ok = False
 
     def read(self):
         snap = self.shared.get_snapshot()
+        self.last_timestamp_ns = snap.gps_timestamp_ns
+        self.last_fix_ok = snap.gps_ok
         return (snap.latitude, snap.longitude, snap.gps_altitude,
                 snap.gps_ground_speed_mps, math.radians(snap.gps_course_deg))
 
@@ -121,7 +126,13 @@ class FlightComputer:
     DELTA_S_MIN =   0.0
     DELTA_S_MAX =  30.0
 
-    def __init__(self, shared=None, use_simulator=True, drop_height: float = 0.0):
+    def __init__(
+        self,
+        shared=None,
+        use_simulator=True,
+        drop_height: float = 0.0,
+        enable_state_persistence: bool = True,
+    ):
         log.info("Initializing Flight Computer...")
 
         # --- Resolve glider_gnc module path (lazy, to avoid package name collisions) ---
@@ -156,6 +167,7 @@ class FlightComputer:
         self._WindEstimatorRLS = _WindEstimatorRLS
 
         self.shared = shared
+        self.enable_state_persistence = enable_state_persistence
         self.dt = 0.05  # 20 Hz loop
 
         if self.shared is not None:
@@ -284,6 +296,13 @@ class FlightComputer:
         self.prev_delta_a   = 0.0
         self.prev_delta_s   = 0.0
         self.last_controller_used = "NEUTRAL"
+        self.controller_counts = {"RL": 0, "PID": 0, "SALVAGE": 0, "NEUTRAL": 0}
+        self.loop_count = 0
+        self.loop_overrun_count = 0
+        self.first_loop_monotonic = 0.0
+        self.last_loop_monotonic = 0.0
+        self.servo_min = 180.0
+        self.servo_max = 0.0
 
         if drop_height > 0.0:
             log.info("[DROP-TEST] Ground altitude offset by -%.1f m (true AGL baseline corrected)", drop_height)
@@ -294,7 +313,7 @@ class FlightComputer:
         # ---------------------------------------------------------------
         # Boot-time reset recovery
         # ---------------------------------------------------------------
-        if not self.use_simulator:
+        if not self.use_simulator and self.enable_state_persistence:
             snapshot = self._load_state()
             if snapshot is not None:
                 log.warning("[RECOVERY] Resuming from .state: state=%s  drogue=%s  alt=%.1f m",
@@ -358,6 +377,13 @@ class FlightComputer:
                 raise ValueError(f"Input shape mismatch: expected [1,{expected_obs}], got {inp.shape}")
             if out.shape != [1, expected_act]:
                 raise ValueError(f"Output shape mismatch: expected [1,{expected_act}], got {out.shape}")
+
+            # Prime ONNX Runtime before the flight watchdog is active. Session
+            # setup and the first kernel invocation can be much slower than
+            # steady-state inference on resource-constrained hardware.
+            warmup_obs = np.zeros((1, expected_obs), dtype=np.float32)
+            for _ in range(3):
+                session.run(None, {inp.name: warmup_obs})
 
             self.rl_session    = session
             self.rl_input_name = inp.name
@@ -439,6 +465,16 @@ class FlightComputer:
         r0, r1 = float(raw[0]), float(raw[1])
         if not math.isfinite(r0) or not math.isfinite(r1):
             raise ValueError(f"NaN/Inf in ONNX output: [{r0}, {r1}]")
+        # Tanh outputs may exceed +/-1 by a few floating-point ULPs. Accept a
+        # tiny numerical tolerance, clamp it, and still reject genuine model
+        # contract violations.
+        tolerance = 1e-5
+        if not (-1.0 - tolerance <= r0 <= 1.0 + tolerance):
+            raise ValueError(f"raw delta_a={r0:.8f} outside tanh range")
+        if not (-1.0 - tolerance <= r1 <= 1.0 + tolerance):
+            raise ValueError(f"raw delta_s={r1:.8f} outside tanh range")
+        r0 = max(-1.0, min(1.0, r0))
+        r1 = max(-1.0, min(1.0, r1))
         delta_a = r0 * 30.0
         delta_s = (r1 + 1.0) / 2.0 * 30.0
         if not (self.DELTA_A_MIN <= delta_a <= self.DELTA_A_MAX):
@@ -472,7 +508,11 @@ class FlightComputer:
 
             # -- Periodic .state write (every STATE_WRITE_INTERVAL_S seconds)
             now = time.time()
-            if not self.use_simulator and (now - self._last_state_write) >= self._STATE_WRITE_INTERVAL_S:
+            if (
+                not self.use_simulator
+                and self.enable_state_persistence
+                and (now - self._last_state_write) >= self._STATE_WRITE_INTERVAL_S
+            ):
                 self._write_state_snapshot()
                 self._last_state_write = now
             # 1. Read Sensors
@@ -493,7 +533,17 @@ class FlightComputer:
             _nue_bearing = math.atan2(_east_m, _north_m)
 
             now = time.time()
-            gps_fresh = (now - self._last_gps_time) <= self.gps_timeout_s
+            gps_timestamp_ns = getattr(self.gps, "last_timestamp_ns", 0)
+            if gps_timestamp_ns > 0:
+                gps_age_s = max(0.0, (time.monotonic_ns() - gps_timestamp_ns) / 1e9)
+                gps_fresh = (
+                    getattr(self.gps, "last_fix_ok", True)
+                    and gps_age_s <= self.gps_timeout_s
+                )
+            else:
+                # SITL and standalone hardware adapters return a fresh sample
+                # directly on every call and do not expose a timestamp.
+                gps_fresh = True
             if not gps_fresh:
                 log.warning("[SALVAGE] GPS stale >%.0fms -- wings level, straight descent.",
                             self.gps_timeout_s * 1000)
@@ -521,6 +571,13 @@ class FlightComputer:
 
             # 3. State Machine
             state = self.state_machine.update(self.ekf_alt.altitude, self.ekf_alt.vertical_velocity)
+            if self.shared is not None:
+                drogue_angle = (
+                    config.GLIDER_DROGUE_DEPLOY_ANGLE
+                    if self.state_machine.drogue_fired
+                    else config.GLIDER_DROGUE_SAFE_ANGLE
+                )
+                self.shared.update(servo_drogue=drogue_angle)
 
             # 4. Guidance
             left_servo  = 90.0
@@ -590,6 +647,14 @@ class FlightComputer:
 
             self.servos.write(left_servo, right_servo)
             self.last_controller_used = controller_used
+            self.controller_counts[controller_used] = self.controller_counts.get(controller_used, 0) + 1
+            self.loop_count += 1
+            loop_monotonic = time.monotonic()
+            if self.first_loop_monotonic == 0.0:
+                self.first_loop_monotonic = loop_monotonic
+            self.last_loop_monotonic = loop_monotonic
+            self.servo_min = min(self.servo_min, left_servo, right_servo)
+            self.servo_max = max(self.servo_max, left_servo, right_servo)
 
             # 5. Telemetry
             packet = (f"{frame_id},{loop_start:.2f},{lat},{lon},{gps_alt},{baro_alt},"
@@ -607,6 +672,7 @@ class FlightComputer:
             # 6. Loop timing enforcement
             elapsed = time.time() - loop_start
             if elapsed > self.dt:
+                self.loop_overrun_count += 1
                 log.warning(f"[WATCHDOG] Loop overrun: {elapsed*1000:.1f}ms > {self.dt*1000:.0f}ms budget")
             else:
                 time.sleep(self.dt - elapsed)

@@ -58,7 +58,7 @@ timing:
 
 # 9. Telemetry / Sensor Health
 telemetry:
-  gps_staleness_timeout_ms: 500  # PID fallback engages if GPS not updated within this window
+  gps_staleness_timeout_ms: 2000  # NEO-M8N default NMEA rate is typically 1 Hz
 
 # 10. RL Policy
 rl:

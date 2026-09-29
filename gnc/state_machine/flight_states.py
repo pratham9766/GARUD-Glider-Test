@@ -49,6 +49,7 @@ class StateMachine:
         # Drogue safety flag — set True when drogue fires, never cleared
         self._drogue_fired  = False
         self._drogue_locked = False   # True = permanently blocked by recovery
+        self.transition_history = [self.state]
 
     # ------------------------------------------------------------------
     # Properties
@@ -81,6 +82,7 @@ class StateMachine:
         log.warning("[SM] force_state: %s -> %s (reset recovery)",
                     self.state.name, target.name)
         self.state = target
+        self.transition_history.append(target)
         # Clear history so stale baro samples don't affect transition logic
         self.baro_history.clear()
 
@@ -124,6 +126,7 @@ class StateMachine:
                         and vertical_velocity < -2.0):
                     log.info("[SM] BOOST -> DROGUE_DESCENT (apogee detected)")
                     self.state = FlightState.DROGUE_DESCENT
+                    self.transition_history.append(self.state)
 
         elif self.state == FlightState.DROGUE_DESCENT:
             # 600m AGL moving-average trigger
@@ -132,6 +135,7 @@ class StateMachine:
                 if avg_agl <= self.deployment_agl_threshold and vertical_velocity < -2.0:
                     log.info("[SM] DROGUE_DESCENT -> DEPLOYMENT_TRIGGER (AGL=%.1f m)", avg_agl)
                     self.state = FlightState.DEPLOYMENT_TRIGGER
+                    self.transition_history.append(self.state)
 
         elif self.state == FlightState.DEPLOYMENT_TRIGGER:
             # Mark drogue as fired (unless locked out from a prior flight)
@@ -139,15 +143,18 @@ class StateMachine:
                 self._drogue_fired = True
             log.info("[SM] DEPLOYMENT_TRIGGER -> DEPLOYMENT_VERIFICATION")
             self.state = FlightState.DEPLOYMENT_VERIFICATION
+            self.transition_history.append(self.state)
 
         elif self.state == FlightState.DEPLOYMENT_VERIFICATION:
             # Parafoil wings lock under aero load — then hand off to GNC
             log.info("[SM] DEPLOYMENT_VERIFICATION -> GUIDED_DESCENT")
             self.state = FlightState.GUIDED_DESCENT
+            self.transition_history.append(self.state)
 
         elif self.state == FlightState.GUIDED_DESCENT:
             if agl <= 5.0:
                 log.info("[SM] GUIDED_DESCENT -> LANDED (AGL=%.1f m)", agl)
                 self.state = FlightState.LANDED
+                self.transition_history.append(self.state)
 
         return self.state

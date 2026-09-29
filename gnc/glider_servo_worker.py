@@ -9,12 +9,22 @@ class MockGliderServos:
         logger.info("MockGliderServos initialized.")
         self.left_angle = 90.0
         self.right_angle = 90.0
+        self.drogue_angle = config.GLIDER_DROGUE_SAFE_ANGLE
 
     def set_angles(self, left: float, right: float, drogue: float = None):
-        if abs(left - self.left_angle) > 1.0 or abs(right - self.right_angle) > 1.0:
-            logger.info(f"MockGliderServos -> left={left:.1f} right={right:.1f}")
+        changed = abs(left - self.left_angle) > 1.0 or abs(right - self.right_angle) > 1.0
+        drogue_changed = drogue is not None and abs(drogue - self.drogue_angle) > 1.0
+        if changed or drogue_changed:
+            logger.info(
+                "MockGliderServos -> left=%.1f right=%.1f drogue=%s",
+                left,
+                right,
+                "INHIBITED" if drogue is None else f"{drogue:.1f}",
+            )
             self.left_angle = left
             self.right_angle = right
+            if drogue is not None:
+                self.drogue_angle = drogue
 
     def close(self):
         logger.info("MockGliderServos closed.")

@@ -1,6 +1,8 @@
 numpy
 pyyaml
 onnxruntime
+pyserial
+pynmea2
 adafruit-servokit
 adafruit-circuitpython-pca9685
 RPi.GPIO

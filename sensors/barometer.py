@@ -39,15 +39,17 @@ class MockBarometer(BaseBarometer):
         self._read_count += 1
         elapsed = time.time() - self._started_at
         duration = max(config.SIMULATION_DURATION_SEC, 1.0)
-        apogee_time = duration * 0.35
-        landed_time = duration
-        if elapsed < 2.0:
+        if config.MOCK_GLIDER_DESCENT_ONLY:
+            altitude = config.MOCK_START_ALTITUDE_M * max(0.0, 1.0 - elapsed / duration)
+        elif elapsed < 2.0:
             altitude = max(0.0, config.MOCK_START_ALTITUDE_M - self._read_count * 0.5)
-        elif elapsed < apogee_time:
+        elif elapsed < duration * 0.35:
+            apogee_time = duration * 0.35
             climb_fraction = (elapsed - 2.0) / max(apogee_time - 2.0, 1.0)
             altitude = config.TARGET_APOGEE_AGL_M * math.sin(climb_fraction * math.pi / 2.0)
-        elif elapsed < landed_time:
-            descent_fraction = (elapsed - apogee_time) / max(landed_time - apogee_time, 1.0)
+        elif elapsed < duration:
+            apogee_time = duration * 0.35
+            descent_fraction = (elapsed - apogee_time) / max(duration - apogee_time, 1.0)
             altitude = config.TARGET_APOGEE_AGL_M * (1.0 - descent_fraction)
         else:
             altitude = 0.0

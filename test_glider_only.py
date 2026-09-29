@@ -120,6 +120,11 @@ def test_rl_inference() -> bool:
 def test_gnc_loop(duration_sec: int = 30, real_servos: bool = False):
     """Run GNC + Servo workers for N seconds and report loop timing."""
     log.info("=" * 50)
+
+    # Use one coherent descending flight profile for both mock altitude
+    # sensors. Leave a margin so the state remains airborne through the test.
+    config.MOCK_GLIDER_DESCENT_ONLY = True
+    config.SIMULATION_DURATION_SEC = max(float(duration_sec) + 5.0, 10.0)
     log.info("TEST: GNC + Servo Loop (%ds)", duration_sec)
     log.info("=" * 50)
 
@@ -159,7 +164,11 @@ def test_gnc_loop(duration_sec: int = 30, real_servos: bool = False):
     # Mock barometer starts near deployment altitude. Treat zero as ground so
     # the forced guided-descent state remains airborne for the full test.
     drop_height = shared.get_snapshot().baro_altitude
-    fc = FlightComputer(shared, drop_height=drop_height)
+    fc = FlightComputer(
+        shared,
+        drop_height=drop_height,
+        enable_state_persistence=False,
+    )
     fc.state_machine.force_state("GUIDED_DESCENT")
     gnc_thread = control_mgr.register(ManagedThread("GNC", lambda evt: fc.run(evt)))
     servo_thread = control_mgr.register(ManagedThread(
