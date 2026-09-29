@@ -12,6 +12,7 @@ Usage:
     python test_glider_only.py              # full test (30 seconds)
     python test_glider_only.py --duration 60
     python test_glider_only.py --rl-only    # test RL inference speed only
+    python test_glider_only.py --real-servos --duration 30
 """
 
 import argparse
@@ -50,7 +51,7 @@ logging.basicConfig(
 log = logging.getLogger("GliderTest")
 
 
-def test_rl_inference():
+def test_rl_inference() -> bool:
     """Benchmark RL model inference speed on this hardware."""
     import numpy as np
 
@@ -63,13 +64,13 @@ def test_rl_inference():
         import yaml
         with open(gains_path) as f:
             gains = yaml.safe_load(f)
-        obs_dim   = gains.get("rl", {}).get("obs_dim", 17)
-        model_rel = gains.get("rl", {}).get("onnx_model_path", "models/sac_policy_17D.onnx")
+        obs_dim   = gains.get("rl", {}).get("obs_dim", 16)
+        model_rel = gains.get("rl", {}).get("onnx_model_path", "models/sac_policy_16D.onnx")
         model_path = PROJECT_ROOT / model_rel
     except Exception as e:
         log.warning("Could not read gains.yaml: %s", e)
-        obs_dim    = 17
-        model_path = PROJECT_ROOT / "models" / "sac_policy_17D.onnx"
+        obs_dim    = 16
+        model_path = PROJECT_ROOT / "models" / "sac_policy_16D.onnx"
 
     log.info("Looking for model: %s", model_path)
     log.info("Expected obs_dim: %d", obs_dim)
@@ -77,13 +78,13 @@ def test_rl_inference():
     if not model_path.exists():
         log.warning("ONNX model not found — RL inference test SKIPPED")
         log.warning("PID fallback will be used during actual flight")
-        return
+        return False
 
     try:
         import onnxruntime as ort
     except ImportError:
         log.error("onnxruntime not installed — run: pip install onnxruntime")
-        return
+        return False
 
     sess = ort.InferenceSession(str(model_path))
     input_name = sess.get_inputs()[0].name
@@ -106,13 +107,17 @@ def test_rl_inference():
 
     if avg < 5.0:
         log.info("RESULT: PASS ✅ — RL will run as PRIMARY controller")
+        return True
     elif avg < 10.0:
         log.warning("RESULT: MARGINAL ⚠️ — RL may occasionally exceed watchdog → PID fallback")
     else:
         log.warning("RESULT: SLOW ❌ — RL exceeds 5ms watchdog consistently → PID fallback always")
 
 
-def test_gnc_loop(duration_sec: int = 30):
+    return False
+
+
+def test_gnc_loop(duration_sec: int = 30, real_servos: bool = False):
     """Run GNC + Servo workers for N seconds and report loop timing."""
     log.info("=" * 50)
     log.info("TEST: GNC + Servo Loop (%ds)", duration_sec)
@@ -120,7 +125,6 @@ def test_gnc_loop(duration_sec: int = 30):
 
     from core.shared_data import SharedData
     from core.thread_manager import ManagedThread, ThreadManager
-    from core.mission_state import MissionState
     from sensors.gps import gps_worker
     from sensors.imu import imu_worker
     from sensors.barometer import barometer_worker
@@ -128,17 +132,49 @@ def test_gnc_loop(duration_sec: int = 30):
     from gnc.glider_servo_worker import glider_servo_worker
 
     shared = SharedData()
-    thread_mgr = ThreadManager()
+    sensor_mgr = ThreadManager()
+    control_mgr = ThreadManager()
 
-    # Sensor workers (mock)
-    thread_mgr.register(ManagedThread("GPS",       lambda evt: gps_worker(shared, evt)))
-    thread_mgr.register(ManagedThread("IMU",       lambda evt: imu_worker(shared, evt)))
-    thread_mgr.register(ManagedThread("Barometer", lambda evt: barometer_worker(shared, evt)))
+    # Keep navigation sensors simulated while optionally driving real servos.
+    sensor_mgr.register(ManagedThread("GPS",       lambda evt: gps_worker(shared, evt)))
+    sensor_mgr.register(ManagedThread("IMU",       lambda evt: imu_worker(shared, evt)))
+    sensor_mgr.register(ManagedThread("Barometer", lambda evt: barometer_worker(shared, evt)))
 
-    # GNC Flight Computer
-    fc = FlightComputer(shared, drop_height=0.0)
-    thread_mgr.register(ManagedThread("GNC",          lambda evt: fc.run(evt)))
-    thread_mgr.register(ManagedThread("GliderServos", lambda evt: glider_servo_worker(shared, evt)))
+    # A valid sample must exist before FlightComputer captures its altitude
+    # reference. Otherwise a zero first sample can make the test land at once.
+    log.info("Starting mock sensors and waiting for valid samples...")
+    sensor_mgr.start_all()
+    sensor_deadline = time.monotonic() + 5.0
+    while time.monotonic() < sensor_deadline:
+        snap = shared.get_snapshot()
+        if snap.gps_ok and snap.imu_ok and snap.barometer_ok:
+            break
+        time.sleep(0.05)
+    else:
+        sensor_mgr.stop_all()
+        raise RuntimeError("Mock sensors did not become ready within 5 seconds")
+
+    # Construct GNC only after sensor warmup, then force its authoritative
+    # internal state machine into the control state used by this bench test.
+    # Mock barometer starts near deployment altitude. Treat zero as ground so
+    # the forced guided-descent state remains airborne for the full test.
+    drop_height = shared.get_snapshot().baro_altitude
+    fc = FlightComputer(shared, drop_height=drop_height)
+    fc.state_machine.force_state("GUIDED_DESCENT")
+    gnc_thread = control_mgr.register(ManagedThread("GNC", lambda evt: fc.run(evt)))
+    servo_thread = control_mgr.register(ManagedThread(
+        "GliderServos",
+        lambda evt: glider_servo_worker(
+            shared,
+            evt,
+            use_mock=not real_servos,
+            command_drogue=False,
+        ),
+    ))
+
+    if real_servos and not fc.rl_active:
+        sensor_mgr.stop_all()
+        raise RuntimeError("RL model is not active; refusing to move real servos")
 
     # Force straight into GUIDED_DESCENT so GNC actually runs
     shared.update(
@@ -148,8 +184,24 @@ def test_gnc_loop(duration_sec: int = 30):
     )
     shared.start_mission_clock()
 
-    log.info("Starting all glider threads...")
-    thread_mgr.start_all()
+    if real_servos:
+        log.warning("REAL SERVO TEST: unload or disconnect both brake lines.")
+        log.warning("Left/right channels will move; the drogue channel is inhibited.")
+        for remaining in range(3, 0, -1):
+            log.warning("Servo actuation starts in %d...", remaining)
+            time.sleep(1.0)
+
+    log.info("Starting GNC and %s servo worker...", "REAL" if real_servos else "mock")
+    control_mgr.start_all()
+    time.sleep(0.5)
+    if not gnc_thread.is_alive:
+        control_mgr.stop_all()
+        sensor_mgr.stop_all()
+        raise RuntimeError("GNC worker failed to start")
+    if real_servos and not servo_thread.is_alive:
+        control_mgr.stop_all()
+        sensor_mgr.stop_all()
+        raise RuntimeError("Real servo initialization failed; check I2C, OE, and dependencies")
 
     stop = threading.Event()
 
@@ -164,22 +216,27 @@ def test_gnc_loop(duration_sec: int = 30):
 
     last_print = time.monotonic()
     while not stop.is_set() and time.monotonic() < deadline:
+        if real_servos and not servo_thread.is_alive:
+            log.error("Real servo worker stopped unexpectedly; ending test.")
+            stop.set()
+            continue
         now = time.monotonic()
         if now - last_print >= 2.0:
             snap = shared.get_snapshot()
             log.info(
-                "STATE=%-18s | baro=%.1fm | left_pwm=%.1f right_pwm=%.1f | RL=%s",
-                snap.state,
+                "STATE=%-18s | baro=%.1fm | left=%.1f right=%.1f | controller=%s",
+                fc.state_machine.state.name,
                 snap.baro_altitude,
-                getattr(snap, "left_pwm",  90.0),
-                getattr(snap, "right_pwm", 90.0),
-                "YES" if getattr(snap, "rl_active", False) else "PID",
+                snap.servo_left,
+                snap.servo_right,
+                fc.last_controller_used,
             )
             last_print = now
         time.sleep(0.1)
 
     log.info("Test complete — stopping threads.")
-    thread_mgr.stop_all()
+    control_mgr.stop_all()
+    sensor_mgr.stop_all()
     log.info("All threads stopped cleanly ✅")
 
 
@@ -210,6 +267,11 @@ def main():
     parser = argparse.ArgumentParser(description="Glider-only hardware test")
     parser.add_argument("--duration", type=int, default=30, help="GNC test duration in seconds (default 30)")
     parser.add_argument("--rl-only",  action="store_true", help="Only run RL inference speed test")
+    parser.add_argument(
+        "--real-servos",
+        action="store_true",
+        help="Drive real PCA9685 left/right servos with mock sensors; drogue is inhibited",
+    )
     args = parser.parse_args()
 
     log.info("GARUDA TARSR — Glider-Only Test")
@@ -221,7 +283,7 @@ def main():
     log.info("")
 
     # Test 2: RL inference
-    test_rl_inference()
+    rl_passed = test_rl_inference()
     log.info("")
 
     if args.rl_only:
@@ -229,7 +291,10 @@ def main():
         return
 
     # Test 3: Full GNC loop
-    test_gnc_loop(duration_sec=args.duration)
+    if args.real_servos and not rl_passed:
+        raise SystemExit("RL benchmark failed; refusing to start real servos")
+
+    test_gnc_loop(duration_sec=args.duration, real_servos=args.real_servos)
 
 
 if __name__ == "__main__":

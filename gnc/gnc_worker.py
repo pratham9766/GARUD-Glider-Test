@@ -97,7 +97,7 @@ class SharedGPS:
     def read(self):
         snap = self.shared.get_snapshot()
         return (snap.latitude, snap.longitude, snap.gps_altitude,
-                snap.gps_ground_speed_mps, snap.gps_course_deg)
+                snap.gps_ground_speed_mps, math.radians(snap.gps_course_deg))
 
 
 class SharedServos:
@@ -283,6 +283,7 @@ class FlightComputer:
         self.wind_estimator = self._WindEstimatorRLS()
         self.prev_delta_a   = 0.0
         self.prev_delta_s   = 0.0
+        self.last_controller_used = "NEUTRAL"
 
         if drop_height > 0.0:
             log.info("[DROP-TEST] Ground altitude offset by -%.1f m (true AGL baseline corrected)", drop_height)
@@ -588,6 +589,7 @@ class FlightComputer:
                 right_servo = max(60.0, min(120.0, 90.0 + delta_s + delta_a))
 
             self.servos.write(left_servo, right_servo)
+            self.last_controller_used = controller_used
 
             # 5. Telemetry
             packet = (f"{frame_id},{loop_start:.2f},{lat},{lon},{gps_alt},{baro_alt},"

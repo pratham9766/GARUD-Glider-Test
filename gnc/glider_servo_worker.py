@@ -70,11 +70,26 @@ class RealGliderServos:
         # self._oe.value = True
 
 
-def glider_servo_worker(shared, stop_event) -> None:
-    """Reads servo angles from SharedData and sends them to hardware PCA9685."""
-    logger.info("Glider servo worker started (mock=%s).", config.USE_MOCK_HARDWARE)
+def glider_servo_worker(
+    shared,
+    stop_event,
+    use_mock: bool | None = None,
+    command_drogue: bool = True,
+) -> None:
+    """Read commands from SharedData and drive mock or real glider servos.
+
+    ``use_mock`` supports hardware-in-the-loop tests with mock sensors and real
+    servos. ``command_drogue=False`` prevents bench tests from moving the
+    deployment servo.
+    """
+    mock_mode = config.USE_MOCK_HARDWARE if use_mock is None else use_mock
+    logger.info(
+        "Glider servo worker started (mock=%s, command_drogue=%s).",
+        mock_mode,
+        command_drogue,
+    )
     
-    if config.USE_MOCK_HARDWARE:
+    if mock_mode:
         hw = MockGliderServos()
     else:
         try:
@@ -91,7 +106,7 @@ def glider_servo_worker(shared, stop_event) -> None:
             hw.set_angles(
                 left=snap.servo_left, 
                 right=snap.servo_right,
-                drogue=snap.servo_drogue
+                drogue=snap.servo_drogue if command_drogue else None,
             )
             time.sleep(0.05)  # 20 Hz loop
             
