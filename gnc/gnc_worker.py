@@ -371,7 +371,7 @@ class FlightComputer:
                         alt_excess, pitch, roll, yaw_rate,
                         gps_speed, gps_heading, altitude):
         """
-        17D observation builder. Must match training/env.py _get_obs() exactly.
+        16D observation builder. Must match training/env.py _get_obs() exactly.
         obs[15] time_to_impact is capped at 2.0 (preserved from env.py line 116).
         """
         heading_err = (target_bearing - gps_heading + math.pi) % (2 * math.pi) - math.pi
@@ -410,7 +410,6 @@ class FlightComputer:
             math.cos(track_err),       # obs[13]
             lateral_drift_norm,        # obs[14]
             time_to_impact_norm,       # obs[15]
-            altitude / 600.0,          # obs[16] normalized raw altitude (0=ground, 1=deployment)
         ]], dtype=np.float32)
 
     def _write_state_snapshot(self) -> None:
