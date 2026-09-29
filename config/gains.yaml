@@ -70,20 +70,18 @@ rl:
 # 11. Hardware Configuration (confirmed from GARUD HAT schematic Rev 2, 2026-08-04)
 hardware:
 
-  # --- SPI bus (SPI0: SCLK=GPIO11, MOSI=GPIO10, MISO=GPIO9) ---
-  # Both BNO085 and BMP388 share SPI0. Each has its own software CS pin.
-  # BNO085 -- SPI (NOT I2C -- confirmed from schematic)
-  bno085_cs_pin:    5    # CS_BNO  -> GPIO5  / Pi Pin 29
-  bno085_rst_pin:   6    # RST_BNO -> GPIO6  / Pi Pin 31
-  bno085_int_pin:   27   # INT_BNO -> GPIO27 / Pi Pin 13
-  bno085_refresh_hz: 10
+  # --- I2C1 bus (SDA=GPIO2 Pin3, SCL=GPIO3 Pin5) ---
+  # Tested BNO085 runtime connection.
+  bno085_transport: "I2C"
+  bno085_address:   0x4A
+  bno085_refresh_hz: 100
 
-  # BMP388 -- SPI (CS on GPIO22, NOT CE0/GPIO8)
-  bmp388_cs_pin:    22   # CS_BMP  -> GPIO22 / Pi Pin 15
+  # --- SPI0 bus (SCLK=GPIO11, MOSI=GPIO10, MISO=GPIO9) ---
+  # Tested BMP388 runtime connection.
+  bmp388_cs_pin:    8    # GPIO8 / physical pin 24
   bmp388_int_pin:   17   # INT_BMP -> GPIO17 / Pi Pin 11
 
-  # --- I2C bus (SDA=GPIO2 Pin3, SCL=GPIO3 Pin5) ---
-  # INA219 and PCA9685 share the I2C bus.
+  # PCA9685 and optional INA219 share I2C1 with the BNO085.
   # ADDRESS CONFLICT RESOLVED: one must be jumpered -- confirm from physical board.
   i2c_addresses:
     ina219:  0x41   # INA219: ADDR pin to VCC -> 0x41
@@ -93,7 +91,7 @@ hardware:
   pca9685_oe_pin: 4      # OE_Servo -> GPIO4 / Pi Pin 7
 
   # --- UART: XBee 2.4 GHz telemetry (GPIO14=RX, GPIO15=TX) ---
-  # GPS is on SPI so ttyAMA0 is free for XBee.
+  # GPS uses a USB UART at /dev/ttyUSB0, leaving ttyAMA0 free for XBee.
   # Prerequisite: disable Bluetooth so ttyAMA0 is available:
   #   Add to /boot/config.txt:  dtoverlay=disable-bt
   #   sudo systemctl disable hciuart

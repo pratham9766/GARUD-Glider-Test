@@ -3,6 +3,10 @@ pyyaml
 onnxruntime
 pyserial
 pynmea2
+Adafruit-Blinka
 adafruit-servokit
+adafruit-circuitpython-bmp3xx
+adafruit-circuitpython-bno08x
 adafruit-circuitpython-pca9685
+adafruit-circuitpython-busdevice
 RPi.GPIO
